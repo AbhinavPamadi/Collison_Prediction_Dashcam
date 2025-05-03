@@ -1,128 +1,109 @@
 import os
-import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, TimeDistributed, Conv2D, MaxPooling2D, GlobalAveragePooling2D, LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.utils import Sequence
-from tensorflow.keras.callbacks import EarlyStopping
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import numpy as np
+import pandas as pd
 from glob import glob
-import random
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import TimeDistributed, Conv2D, MaxPooling2D, Flatten, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 
-# CONFIGURATION 
+# CONFIGURATION
 FRAME_DIR = r"C:\Users\..\Documents\collision_prediction_dataset\frames"
-SEQUENCE_LENGTH = 6      
-FRAME_HEIGHT = 112       
-FRAME_WIDTH = 112        
-CHANNELS = 3             
-EPOCHS = 10              
-BATCH_SIZE = 8           
-MODEL_SAVE_PATH = r"C:\Users\..\Documents\collision_prediction_dataset\car_crash_detector_model.keras"
+CSV_PATH = r"C:\Users\..\Documents\collision_prediction_dataset\train.csv"
+SEQUENCE_LENGTH = 6  
+FRAME_HEIGHT = 112
+FRAME_WIDTH = 112
+CHANNELS = 3
+BATCH_SIZE = 8
+EPOCHS = 10
+LEARNING_RATE = 1e-5
 
-# DATA GENERATOR 
-class FrameSequenceGenerator(Sequence):
-    def __init__(self, filepaths, labels, batch_size):
-        self.filepaths = filepaths
-        self.labels = labels
-        self.batch_size = batch_size
+# LOAD CSV
+df = pd.read_csv(CSV_PATH)
 
-    def __len__(self):
-        return int(np.ceil(len(self.filepaths) / self.batch_size))
 
-    def __getitem__(self, idx):
-        batch_paths = self.filepaths[idx * self.batch_size:(idx + 1) * self.batch_size]
-        batch_labels = self.labels[idx * self.batch_size:(idx + 1) * self.batch_size]
-        batch_data = []
-        for path in batch_paths:
-            frames = np.load(path)[:SEQUENCE_LENGTH]
-            frames = np.array([cv2.resize(f, (FRAME_WIDTH, FRAME_HEIGHT)) for f in frames])
-            if len(frames) < SEQUENCE_LENGTH:
-                pad = np.tile(frames[-1:], (SEQUENCE_LENGTH - len(frames), 1, 1, 1))
-                frames = np.concatenate([frames, pad], axis=0)
-            batch_data.append(frames)
-        return np.array(batch_data), np.array(batch_labels)
+filepaths, targets = [], []
+for _, row in df.iterrows():
+    vid = str(int(row['id'])).zfill(5)
+    for label in ['Crash', 'NonCrash']:
+        path = os.path.join(FRAME_DIR, label, f"{vid}.npy")
+        if os.path.exists(path):
+            filepaths.append(path)
+            if label == 'Crash' and not pd.isna(row['time_of_event']):
+                evt = float(row['time_of_event']) 
+                alt = float(row['time_of_alert']) 
+                targets.append([evt, alt])
+            else:
+                targets.append([0.0, 0.0])  
+            break
 
-# GATHER FILEPATHS AND LABELS 
-crash_paths = glob(os.path.join(FRAME_DIR, "Crash", "*.npy"))
-noncrash_paths = glob(os.path.join(FRAME_DIR, "NonCrash", "*.npy"))
-filepaths = crash_paths + noncrash_paths
-labels = [1] * len(crash_paths) + [0] * len(noncrash_paths)
+print(f"Total samples: {len(filepaths)} (Crash+NonCrash)")
+if len(filepaths) == 0:
+    raise RuntimeError("No .npy frames found. Run Part 2 extraction first.")
 
-# SHUFFLE AND SPLIT
-combined = list(zip(filepaths, labels))
-random.shuffle(combined)
-filepaths, labels = zip(*combined)
-split_idx = int(0.8 * len(filepaths))
-train_paths, val_paths = filepaths[:split_idx], filepaths[split_idx:]
-train_labels, val_labels = labels[:split_idx], labels[split_idx:]
+# SPLIT
+train_paths, val_paths, train_targets, val_targets = train_test_split(
+    filepaths, targets, test_size=0.2, random_state=42
+)
+print(f"Train: {len(train_paths)}  Val: {len(val_paths)}")
 
-# GENERATORS 
-train_gen = FrameSequenceGenerator(train_paths, train_labels, BATCH_SIZE)
-val_gen = FrameSequenceGenerator(val_paths, val_labels, BATCH_SIZE)
+# DATA GENERATOR
+def data_generator(paths, targets):
+    while True:
+        for i in range(0, len(paths), BATCH_SIZE):
+            batch_paths = paths[i:i+BATCH_SIZE]
+            batch_y = targets[i:i+BATCH_SIZE]
+            batch_X = []
+            for p in batch_paths:
+                seq = np.load(p)
+                seq = seq[:SEQUENCE_LENGTH]
+                # resize and normalize
+                frames = [cv2.resize(f, (FRAME_WIDTH, FRAME_HEIGHT)) for f in seq]
+                if len(frames) < SEQUENCE_LENGTH:
+                    pad = [frames[-1]]*(SEQUENCE_LENGTH - len(frames))
+                    frames.extend(pad)
+                arr = np.array(frames, dtype=np.float32)/255.0
+                batch_X.append(arr)
+            yield np.array(batch_X), np.array(batch_y, dtype=np.float32)
 
-# MODEL ARCHITECTURE
-input_layer = Input(shape=(SEQUENCE_LENGTH, FRAME_HEIGHT, FRAME_WIDTH, CHANNELS))
-x = TimeDistributed(Conv2D(32, (3, 3), activation='relu'))(input_layer)
-x = TimeDistributed(MaxPooling2D((2, 2)))(x)
-x = TimeDistributed(Conv2D(64, (3, 3), activation='relu'))(x)
-x = TimeDistributed(GlobalAveragePooling2D())(x)
-x = LSTM(64)(x)
-x = Dropout(0.5)(x)
-x = Dense(64, activation='relu')(x)
-output = Dense(1, activation='sigmoid')(x)
-model = Model(inputs=input_layer, outputs=output)
-model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+# MODEL DEFINITION
+model = Sequential([
+    TimeDistributed(Conv2D(32, (3,3), activation='relu'), input_shape=(SEQUENCE_LENGTH, FRAME_HEIGHT, FRAME_WIDTH, CHANNELS)),
+    TimeDistributed(MaxPooling2D(2,2)),
+    TimeDistributed(Conv2D(64, (3,3), activation='relu')),
+    TimeDistributed(MaxPooling2D(2,2)),
+    TimeDistributed(Flatten()),
+    LSTM(128),
+    Dense(64, activation='relu'),
+    Dropout(0.5),
+    Dense(2, activation='linear')  
+])
+model.compile(
+    optimizer=Adam(LEARNING_RATE),
+    loss='mae',
+    metrics=['mae']
+)
 model.summary()
 
 # CALLBACKS
-early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1),
+    ModelCheckpoint("collision_time_predictor_norm.keras", save_best_only=True)
+]
 
-# TRAIN 
-history = model.fit(
-    train_gen,
-    validation_data=val_gen,
+# TRAIN
+model.fit(
+    data_generator(train_paths, train_targets),
+    validation_data=data_generator(val_paths, val_targets),
+    steps_per_epoch=len(train_paths)//BATCH_SIZE,
+    validation_steps=len(val_paths)//BATCH_SIZE,
     epochs=EPOCHS,
-    callbacks=[early_stop]
+    callbacks=callbacks
 )
 
-
-model.save(MODEL_SAVE_PATH)
-print(f"✅ Model saved to {MODEL_SAVE_PATH}")
-
-
-loss, acc = model.evaluate(val_gen)
-print(f"✅ Test Accuracy: {acc:.4f}")
-
-# PLOT LOSS & ACCURACY 
-plt.figure()
-plt.plot(history.history['loss'], label='train loss')
-plt.plot(history.history['val_loss'], label='val loss')
-plt.title('Loss over Epochs')
-plt.xlabel('Epoch')
-plt.ylabel('Binary Crossentropy')
-plt.legend()
-plt.show()
-
-plt.figure()
-plt.plot(history.history['accuracy'], label='train acc')
-plt.plot(history.history['val_accuracy'], label='val acc')
-plt.title('Accuracy over Epochs')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-plt.legend()
-plt.show()
-
-# CONFUSION MATRIX 
-y_true, y_pred = [], []
-for Xb, yb in val_gen:
-    preds = (model.predict(Xb) >= 0.5).astype(int).flatten()
-    y_true.extend(yb)
-    y_pred.extend(preds)
-cm = confusion_matrix(y_true, y_pred)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['NonCrash','Crash'])
-disp.plot()
-plt.title('Confusion Matrix')
-plt.show()
+# SAVE FINAL
+model.save(r"C:\Users\..\Documents\collision_prediction_dataset\collision_time_predictor_norm.keras")
+print("Training complete and model saved as collision_time_predictor_norm.keras")

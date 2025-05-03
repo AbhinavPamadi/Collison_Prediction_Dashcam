@@ -1,46 +1,51 @@
+# --- PART 4: SINGLE VIDEO INFERENCE ---
 import os
-import numpy as np
 import cv2
+import numpy as np
+import pandas as pd
 from tensorflow.keras.models import load_model
 
-# CONFIGURATION 
-MODEL_PATH = r"C:\Users\..\Documents\collision_prediction_dataset\car_crash_detector_model.keras"
-SEQUENCE_LENGTH = 6
+
+VIDEO_ID = 1924
+MODEL_PATH = r"C:\Users\..\Documents\collision_prediction_dataset\collision_time_predictor_norm.keras"
+FRAME_DIR = r"C:\Users\..\Documents\collision_prediction_dataset\frames"
+CSV_PATH = r"C:\Users\..\Documents\collision_prediction_dataset\train.csv"
+SEQUENCE_LENGTH = 20
 FRAME_HEIGHT = 112
 FRAME_WIDTH = 112
 CHANNELS = 3
+MAX_DURATION = 40.0
+
 
 model = load_model(MODEL_PATH)
 
-# FUNCTION TO EXTRACT FRAMES FROM VIDEO
-def extract_video_frames(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
 
-    while len(frames) < SEQUENCE_LENGTH:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
-        frame = frame.astype(np.float32) / 255.0
-        frames.append(frame)
+vid = str(int(VIDEO_ID)).zfill(5)
+df = pd.read_csv(CSV_PATH)
+row = df[df['id'] == VIDEO_ID].iloc[0]
 
-    cap.release()
+# Check path
+path = os.path.join(FRAME_DIR, "Crash", f"{vid}.npy")
+if not os.path.exists(path):
+    print(f" No crash in {vid} video")
+    exit()
 
-    while len(frames) < SEQUENCE_LENGTH:
-        frames.append(frames[-1])
+# Load and preprocess
+seq = np.load(path)
+seq = seq[:SEQUENCE_LENGTH]
+frames = [cv2.resize(f, (FRAME_WIDTH, FRAME_HEIGHT)) for f in seq]
+if len(frames) < SEQUENCE_LENGTH:
+    frames += [frames[-1]] * (SEQUENCE_LENGTH - len(frames))
+arr = np.array(frames, dtype=np.float32) / 255.0
+arr = np.expand_dims(arr, axis=0)
 
-    return np.array(frames[:SEQUENCE_LENGTH])
+# Predict
+pred = model.predict(arr)[0]
+pred_event = round(pred[0] * MAX_DURATION, 2)
+pred_alert = round(pred[1] * MAX_DURATION, 2)
 
-# PREDICTION FUNCTION
-def predict_collision(video_path):
-    frames = extract_video_frames(video_path)
-    input_data = np.expand_dims(frames, axis=0)  # shape: (1, 6, 112, 112, 3)
-    prediction = model.predict(input_data)[0][0]
-    label = "Crash" if prediction >= 0.5 else "NonCrash"
-    print(f"Prediction: {label} (Confidence: {prediction:.4f})")
-    return label, prediction
-
-
-test_video_path = r"C:\Users\..\Documents\collision_prediction_dataset\test\00012.mp4"
-predict_collision(test_video_path)
+print(f"  Prediction for Video ID {VIDEO_ID}")
+print(f"  True Event Time: {row['time_of_event']}")
+print(f"  True Alert Time: {row['time_of_alert']}")
+print(f"  Predicted Event Time: {pred_event}")
+print(f"  Predicted Alert Time: {pred_alert}")
